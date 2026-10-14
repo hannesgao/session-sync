@@ -18,7 +18,10 @@ Not yet: encryption, locking, automatic hooks, environment notice (Phase 2); WIP
   `https://github.com/me/X` are the same repo, wherever it's cloned.
 - `/pickup` (on the other machine, inside a Claude Code session in the same repo) lists the repo's
   sessions, downloads one, and rewrites path prefixes in the raw text — source Claude project dir,
-  repo root and home → the local ones. The JSONL schema is never touched. The files land in the
+  repo root and home → the local ones. The JSONL schema is never touched. Prefixes are the
+  *logical* paths Claude Code writes into transcripts (the session's `cwd`, `$PWD`, `$HOME`), not
+  symlink-resolved ones (on macOS `/tmp` is really `/private/tmp`); when the resolved path differs
+  it is stored in `meta.json` as an extra alias prefix and rewritten too. The files land in the
   project dir of the session running `/pickup` (session-relay never re-derives Claude Code's
   directory encoding), then you type `/resume <id>`.
 - Safety: pull never deletes anything; a file it would overwrite is first copied to
@@ -104,7 +107,10 @@ claude plugin validate --strict .
 
 The tests simulate two machines (`/tmp/mA/Users/alice/...` as macOS, `/tmp/mB/home/bob/...` as WSL)
 sharing an rclone `local` remote, push as A, pull as B, and check rewriting, placement, metadata and
-the no-duplicates rule. They need `git` and `rclone` on PATH.
+the no-duplicates rule. The same two-machine tests run again with A's home and repo reached
+through a symlink (`/tmp/mA -> /tmp/mA-phys`), and with both machines behind symlinks, so the
+macOS `/tmp -> /private/tmp` layout is covered on Linux too. They need `git` and `rclone` on PATH;
+the test subprocesses set `PYTHONDONTWRITEBYTECODE=1` so no bytecode caches land in the fake homes.
 
 ## Prior art
 

@@ -16,6 +16,9 @@ Design notes
 - The transcript JSONL is treated as opaque text. The only change made on pull
   is a path-prefix substitution (source project dir, repo root and home ->
   local ones) driven by the sidecar meta.json written at push time.
+- Prefixes are logical paths (symlinks kept), because that is what Claude
+  Code writes into transcripts (e.g. /tmp/... on macOS, not /private/tmp/...).
+  When the symlink-resolved path differs it is recorded as an alias prefix.
 - Pull never deletes anything locally. Files it would overwrite are first
   copied to <data-dir>/backups/, which is outside ~/.claude/projects so the
   session id never exists twice where `claude --resume <id>` searches.
@@ -293,11 +296,83 @@ def repo_key_for(normalized_url):
     return "%s-%s" % (slug, digest)
 
 
-def repo_info(cwd, remote_name=None):
+def same_dir(a, b):
+    try:
+        return os.path.samefile(str(a), str(b))
+    except OSError:
+        return False
+
+
+def logical_cwd(explicit=None):
+    """The working directory as the shell / Claude Code sees it, symlinks kept.
+
+    os.getcwd() always returns the symlink-resolved path, so prefer --cwd,
+    then $PWD when it names the same directory (shells keep it logical).
+    """
+    if explicit:
+        return Path(os.path.abspath(os.path.expanduser(explicit)))
+    physical = os.getcwd()
+    pwd = os.environ.get("PWD")
+    if pwd and os.path.isabs(pwd) and same_dir(pwd, physical):
+        return Path(os.path.normpath(pwd))
+    return Path(physical)
+
+
+def logical_root(candidates, physical_root):
+    """The nearest ancestor of a candidate path that is physical_root.
+
+    git rev-parse --show-toplevel resolves symlinks; walking up a logical
+    path (a session cwd, $PWD) gives the same directory spelled the way
+    transcripts spell it. Falls back to physical_root.
+    """
+    for cand in candidates:
+        if not cand or not os.path.isabs(str(cand)):
+            continue
+        path = Path(os.path.normpath(str(cand)))
+        for anc in [path] + list(path.parents):
+            if same_dir(anc, physical_root):
+                return anc
+    return Path(physical_root)
+
+
+def resolved_aliases(path):
+    """[symlink-resolved form of path] if it differs from path, else []."""
+    real = os.path.realpath(str(path))
+    return [real] if real != str(path) else []
+
+
+def transcript_cwd(path):
+    """The first "cwd" recorded in a transcript: the session's logical cwd.
+
+    Read-only; the transcript is not modified or re-serialized.
+    """
+    try:
+        with open(str(path), encoding="utf-8", errors="replace") as fh:
+            for n, line in enumerate(fh):
+                if n >= 200:
+                    break
+                if '"cwd"' not in line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                cwd = rec.get("cwd") if isinstance(rec, dict) else None
+                if isinstance(cwd, str) and cwd.startswith("/"):
+                    return cwd
+    except OSError:
+        pass
+    return None
+
+
+def repo_info(cwd, remote_name=None, hints=()):
+    """Repo identity and root. root is logical (see logical_root); hints are
+    extra logical paths inside the repo to try before cwd."""
     proc = run_git(cwd, "rev-parse", "--show-toplevel")
     if proc.returncode != 0:
         raise RelayError("%s is not inside a git repository" % cwd)
-    root = Path(proc.stdout.strip()).resolve()
+    toplevel = proc.stdout.strip()
+    root = logical_root(list(hints) + [cwd], toplevel)
 
     names = [n for n in run_git(root, "remote").stdout.split() if n]
     if remote_name:
@@ -322,6 +397,7 @@ def repo_info(cwd, remote_name=None):
     head = run_git(root, "rev-parse", "HEAD")
     return {
         "root": root,
+        "toplevel": toplevel,
         "remote_name": name,
         "remote_url": normalized,
         "repo_key": repo_key_for(normalized),
@@ -402,7 +478,12 @@ def _check_prefix(path, what):
 
 
 def build_rewrite_pairs(meta, local):
-    """(source_prefix, local_prefix, label) for every prefix that differs."""
+    """(source_prefix, local_prefix, label) for every prefix that differs.
+
+    Each source prefix is the logical path plus optional aliases (its
+    symlink-resolved form, meta "<key>_aliases"); all map to the local
+    logical prefix.
+    """
     pairs = []
     seen = set()
     for label, src_key, dst in (
@@ -410,17 +491,23 @@ def build_rewrite_pairs(meta, local):
         ("repo root", "source_repo_root", local["repo_root"]),
         ("home", "source_home", local["home"]),
     ):
-        src = meta.get(src_key)
-        if not src or not dst:
+        primary = meta.get(src_key)
+        if not primary or not dst:
             continue
-        src, dst = str(src).rstrip("/") or "/", str(dst).rstrip("/") or "/"
-        if src == "/" or src in seen:
-            continue
-        _check_prefix(src, "source %s" % label)
+        aliases = meta.get(src_key + "_aliases") or []
+        if not isinstance(aliases, list):
+            aliases = []
+        dst = str(dst).rstrip("/") or "/"
         _check_prefix(dst, "local %s" % label)
-        seen.add(src)
-        if src != dst:
-            pairs.append((src, dst, label))
+        for i, src in enumerate([primary] + aliases):
+            src_label = label if i == 0 else "%s alias" % label
+            src = str(src).rstrip("/") or "/"
+            if src == "/" or src in seen:
+                continue
+            _check_prefix(src, "source %s" % src_label)
+            seen.add(src)
+            if src != dst:
+                pairs.append((src, dst, src_label))
     return pairs
 
 
@@ -438,8 +525,11 @@ class Rewriter(object):
         self.counts = dict((label, 0) for _, _, label in pairs)
         if self.mapping:
             alternation = "|".join(re.escape(s) for s in sorted(self.mapping, key=len, reverse=True))
+            # A prefix starts at a non-name char, or right after a JSON
+            # escape (\n, \r, \t): in raw JSONL a path at the start of a
+            # line inside a multi-line string follows the letter of "\n".
             self.regex = re.compile(
-                r"(?<![\w.-])(?:%s)(?!%s|\.%s)" % (alternation, _NAME_CHAR, _NAME_CHAR)
+                r"(?:(?<![\w.-])|(?<=\\[nrt]))(?:%s)(?!%s|\.%s)" % (alternation, _NAME_CHAR, _NAME_CHAR)
             )
         else:
             self.regex = None
@@ -476,7 +566,7 @@ class Rewriter(object):
 
 def resolve_source_transcript(cfg, sid, explicit, cwd):
     if explicit:
-        path = Path(explicit).expanduser().resolve()
+        path = Path(os.path.abspath(os.path.expanduser(explicit)))
         if not path.is_file():
             raise RelayError("transcript not found: %s" % path)
         if path.name != "%s.jsonl" % sid:
@@ -504,10 +594,13 @@ def cmd_push(args):
     cfg = Config(args)
     root = cfg.require_remote()
     sid = validate_session_id(args.session)
-    cwd = Path(args.cwd or os.getcwd()).resolve()
+    cwd = logical_cwd(args.cwd)
     repo = repo_info(cwd, args.git_remote)
     transcript = resolve_source_transcript(cfg, sid, args.transcript, cwd)
+    # The transcript's own cwd is how Claude Code spells paths in it.
+    repo["root"] = logical_root([transcript_cwd(transcript), cwd], repo["toplevel"])
     project_dir = transcript.parent
+    home = Path.home()
     files = session_files(project_dir, sid)
     os_name, os_detail = detect_os()
 
@@ -517,9 +610,12 @@ def cmd_push(args):
         "remote_url": repo["remote_url"],
         "repo_key": repo["repo_key"],
         "source_repo_root": str(repo["root"]),
+        "source_repo_root_aliases": resolved_aliases(repo["root"]),
         "source_cwd": str(cwd),
-        "source_home": str(Path.home()),
+        "source_home": str(home),
+        "source_home_aliases": resolved_aliases(home),
         "source_project_dir": str(project_dir),
+        "source_project_dir_aliases": resolved_aliases(project_dir),
         "os": os_name,
         "os_detail": os_detail,
         "path_style": "posix" if os_name != "Windows" else "windows",
@@ -587,7 +683,7 @@ def fetch_metas(cfg, root, repo_key):
 def cmd_list(args):
     cfg = Config(args)
     root = cfg.require_remote()
-    cwd = Path(args.cwd or os.getcwd()).resolve()
+    cwd = logical_cwd(args.cwd)
     repo = repo_info(cwd, args.git_remote)
     metas = fetch_metas(cfg, root, repo["repo_key"])
     for meta in metas:
@@ -615,7 +711,7 @@ def cmd_list(args):
 
 def resolve_local_project_dir(cfg, args, cwd):
     if args.project_dir:
-        return Path(args.project_dir).expanduser().resolve(), "--project-dir"
+        return Path(os.path.abspath(os.path.expanduser(args.project_dir))), "--project-dir"
     if args.current_session:
         current = validate_session_id(args.current_session)
         hits = find_transcripts(cfg, current)
@@ -623,7 +719,8 @@ def resolve_local_project_dir(cfg, args, cwd):
             return hits[0].parent, "current session %s" % current
         if len(hits) > 1:
             raise RelayError("current session %s exists in several project dirs" % current)
-    recorded = load_state(cfg).get("project_dirs", {}).get(str(cwd))
+    dirs = load_state(cfg).get("project_dirs", {})
+    recorded = dirs.get(str(cwd)) or dirs.get(os.path.realpath(str(cwd)))
     if recorded:
         return Path(recorded), "recorded for %s" % cwd
     raise RelayError(
@@ -636,8 +733,11 @@ def resolve_local_project_dir(cfg, args, cwd):
 def cmd_pull(args):
     cfg = Config(args)
     root = cfg.require_remote()
-    cwd = Path(args.cwd or os.getcwd()).resolve()
-    repo = repo_info(cwd, args.git_remote)
+    cwd = logical_cwd(args.cwd)
+    hints = []
+    if args.current_session:
+        hints = [transcript_cwd(p) for p in find_transcripts(cfg, validate_session_id(args.current_session))]
+    repo = repo_info(cwd, args.git_remote, hints)
 
     if args.session_id:
         sid = validate_session_id(args.session_id)
