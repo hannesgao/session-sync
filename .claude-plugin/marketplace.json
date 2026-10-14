@@ -1,0 +1,15 @@
+{
+  "name": "session-sync",
+  "description": "Marketplace for the session-relay plugin (hannesgao/session-sync).",
+  "owner": {
+    "name": "Hannes Gao",
+    "url": "https://github.com/hannesgao"
+  },
+  "plugins": [
+    {
+      "name": "session-relay",
+      "source": "./",
+      "description": "Hand a Claude Code session off between machines (macOS <-> WSL2) via rclone."
+    }
+  ]
+}
