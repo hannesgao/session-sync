@@ -33,6 +33,10 @@ spec.loader.exec_module(relay)
 
 A_ROOT = Path("/tmp/mA")
 B_ROOT = Path("/tmp/mB")
+# Physical dirs for the symlinked variants (A_ROOT -> A_PHYS), which mirror
+# macOS, where /tmp is a symlink to /private/tmp.
+A_PHYS = Path("/tmp/mA-phys")
+B_PHYS = Path("/tmp/mB-phys")
 A_HOME = "/tmp/mA/Users/alice"
 A_REPO = A_HOME + "/code/X"
 B_HOME = "/tmp/mB/home/bob"
@@ -45,7 +49,8 @@ A_PROJ = A_HOME + "/.claude/projects/-tmp-mA-Users-alice-code-X"
 B_PROJ = B_HOME + "/.claude/projects/-tmp-mB-home-bob-src-X"
 
 # Strings that look like A paths but must NOT be rewritten (different paths).
-NEGATIVE_MARKERS = ["/tmp/mA/Users/alice2/elsewhere.txt", "/private/tmp/mA/Users/alice/code/X/p"]
+# Not /private/tmp/...: on macOS that IS A's path (an alias) and is rewritten.
+NEGATIVE_MARKERS = ["/tmp/mA/Users/alice2/elsewhere.txt", "/srv/tmp/mA/Users/alice/code/X/p"]
 
 HAVE_RCLONE = shutil.which("rclone") is not None
 HAVE_GIT = shutil.which("git") is not None
@@ -72,6 +77,14 @@ def fixture_lines(sid):
     ]
 
 
+def remove_tree(path):
+    path = Path(path)
+    if path.is_symlink():
+        path.unlink()
+    elif path.exists():
+        shutil.rmtree(str(path))
+
+
 def write_jsonl(path, records):
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as fh:
@@ -88,10 +101,15 @@ class Machine(object):
         self.data = self.claude / "plugins" / "data" / "session-relay-session-sync"
         self.rclone_conf = rclone_conf
 
-    def env(self):
+    def env(self, cwd=None):
         env = dict((k, v) for k, v in os.environ.items()
                    if not k.startswith(("CLAUDE_", "RELAY_", "RCLONE_", "GIT_")))
         env.update({
+            # What a shell (and Claude Code's Bash tool) exports: the logical cwd.
+            "PWD": str(cwd or self.repo),
+            # macOS system Python otherwise writes bytecode caches under
+            # $HOME/Library/Caches, i.e. inside the fake machine.
+            "PYTHONDONTWRITEBYTECODE": "1",
             "HOME": str(self.home),
             "RCLONE_CONFIG": str(self.rclone_conf),
             "CLAUDE_PLUGIN_DATA": str(self.data),
@@ -113,18 +131,27 @@ class Machine(object):
         self.git("add", "README")
         self.git("commit", "-q", "-m", "init")
 
-    def relay(self, *args, cwd=None):
+    def relay(self, *args, cwd=None, env=None):
         return subprocess.run([sys.executable, str(RELAY)] + list(args), cwd=str(cwd or self.repo),
-                              env=self.env(), capture_output=True, text=True)
+                              env=env or self.env(cwd), capture_output=True, text=True)
 
 
 @unittest.skipUnless(HAVE_RCLONE and HAVE_GIT, "needs rclone and git")
 class TwoMachineTest(unittest.TestCase):
+    # Subclasses set these to reach a machine's home and repo through a
+    # symlink (/tmp/mX -> /tmp/mX-phys), like macOS's /tmp -> /private/tmp.
+    SYMLINK_A = False
+    SYMLINK_B = False
+
     def setUp(self):
-        for root in (A_ROOT, B_ROOT):
-            if root.exists():
-                shutil.rmtree(str(root))
-        self.addCleanup(lambda: [shutil.rmtree(str(r), ignore_errors=True) for r in (A_ROOT, B_ROOT)])
+        roots = (A_ROOT, B_ROOT, A_PHYS, B_PHYS)
+        for root in roots:
+            remove_tree(root)
+        self.addCleanup(lambda: [remove_tree(r) for r in roots])
+        for link, phys, wanted in ((A_ROOT, A_PHYS, self.SYMLINK_A), (B_ROOT, B_PHYS, self.SYMLINK_B)):
+            if wanted:
+                phys.mkdir()
+                link.symlink_to(phys)
         self.tmp = Path(tempfile.mkdtemp(prefix="relay-test-"))
         self.addCleanup(shutil.rmtree, str(self.tmp), True)
         self.backend = self.tmp / "backend"
@@ -386,7 +413,7 @@ class TwoMachineTest(unittest.TestCase):
 
     def test_remote_from_plugin_option_env(self):
         env_args = ["--base-path", str(self.backend / "relay")]
-        env = self.A.env()
+        env = self.A.env(A_REPO)
         env["CLAUDE_PLUGIN_OPTION_RCLONE_REMOTE"] = "shared:"
         res = subprocess.run([sys.executable, str(RELAY), "push", "--session", self.sid] + env_args,
                              cwd=A_REPO, env=env, capture_output=True, text=True)
@@ -407,6 +434,79 @@ class TwoMachineTest(unittest.TestCase):
         res = self.A.relay("push", "--session", "../../etc", *self.remote_args)
         self.assertEqual(res.returncode, 1)
         self.assertIn("invalid session id", res.stderr)
+
+
+class SymlinkedATest(TwoMachineTest):
+    """Regression (macOS /tmp -> /private/tmp): A's home and repo are reached
+    through a symlink. git rev-parse --show-toplevel and getcwd() return the
+    resolved path, but transcripts hold the logical one. Reruns every
+    TwoMachineTest test in this layout, plus the checks below."""
+
+    SYMLINK_A = True
+
+    def a_phys(self, logical):
+        return logical.replace(str(A_ROOT), os.path.realpath(str(A_ROOT)), 1)
+
+    def test_layout_is_symlinked(self):
+        self.assertTrue(A_ROOT.is_symlink())
+        self.assertNotEqual(os.path.realpath(A_REPO), A_REPO)
+        top = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=A_REPO,
+                             capture_output=True, text=True).stdout.strip()
+        self.assertEqual(top, os.path.realpath(A_REPO))
+
+    def meta(self):
+        key = relay.repo_key_for("github.com/hannesgao/x")
+        return json.loads((self.backend / "relay" / key / self.sid / "meta.json").read_text())
+
+    def test_meta_records_logical_prefixes_and_resolved_aliases(self):
+        self.push_a()
+        meta = self.meta()
+        self.assertEqual(meta["source_repo_root"], A_REPO)
+        self.assertEqual(meta["source_home"], A_HOME)
+        self.assertEqual(meta["source_project_dir"], A_PROJ)
+        self.assertEqual(meta["source_cwd"], A_REPO)
+        self.assertEqual(meta["source_repo_root_aliases"], [os.path.realpath(A_REPO)])
+        self.assertEqual(meta["source_home_aliases"], [os.path.realpath(A_HOME)])
+        self.assertEqual(meta["source_project_dir_aliases"], [os.path.realpath(A_PROJ)])
+
+    def test_session_cwd_used_when_pwd_is_stale(self):
+        # No usable $PWD: the logical root comes from the transcript's cwd
+        # on push and from the running session's transcript on pull.
+        env = self.A.env()
+        env["PWD"] = "/"
+        res = self.A.relay("push", "--session", self.sid, *self.remote_args, env=env)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertEqual(self.meta()["source_repo_root"], A_REPO)
+        env = self.B.env()
+        del env["PWD"]
+        res = self.B.relay("pull", self.sid, "--current-session", self.b_current, *self.remote_args, env=env)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        records = [json.loads(line) for line in
+                   (Path(B_PROJ) / (self.sid + ".jsonl")).read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(records[0]["cwd"], B_REPO)
+
+    def test_resolved_paths_in_transcript_are_rewritten_too(self):
+        # e.g. output of `pwd -P` or a tool that resolved symlinks.
+        extra = {"type": "user", "sessionId": self.sid, "cwd": A_REPO, "uuid": "u9",
+                 "toolUseResult": {"stdout": "%s\n%s/src/app.py\n%s/.zshrc\n%s/%s/tool-results/toolu_01.txt" % (
+                     self.a_phys(A_REPO), self.a_phys(A_REPO), self.a_phys(A_HOME), self.a_phys(A_PROJ), self.sid)}}
+        jsonl = Path(A_PROJ) / (self.sid + ".jsonl")
+        with open(str(jsonl), "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(extra) + "\n")
+        self.push_a()
+        res = self.pull_b()
+        self.assertIn("rewrite  repo root alias", res.stdout)
+        last = json.loads((Path(B_PROJ) / (self.sid + ".jsonl")).read_text(encoding="utf-8").splitlines()[-1])
+        self.assertEqual(last["toolUseResult"]["stdout"], "%s\n%s/src/app.py\n%s/.zshrc\n%s/%s/tool-results/toolu_01.txt" % (
+            B_REPO, B_REPO, B_HOME, B_PROJ, self.sid))
+
+
+class SymlinkedBothTest(TwoMachineTest):
+    """Both machines behind a symlink, as when the suite runs on macOS (all
+    of /tmp is a symlink there); covers the pull side's logical prefixes."""
+
+    SYMLINK_A = True
+    SYMLINK_B = True
 
 
 class NormalizeUrlTest(unittest.TestCase):
@@ -451,6 +551,9 @@ class RewriterTest(unittest.TestCase):
             "/private/Users/alice/a": "/private/Users/alice/a",
             "file:///Users/alice/a": "file:///home/bob/a",
             "(/Users/alice)": "(/home/bob)",
+            # JSON-escaped newline/tab before a path (multi-line strings in JSONL).
+            '"a\\n/Users/alice/x\\t/Users/alice/y"': '"a\\n/home/bob/x\\t/home/bob/y"',
+            "fn/Users/alice/a": "fn/Users/alice/a",
         }
         for src, expected in cases.items():
             self.assertEqual(r.rewrite_text(src), expected, src)
@@ -474,6 +577,16 @@ class RewriterTest(unittest.TestCase):
         with self.assertRaises(relay.RelayError):
             relay.build_rewrite_pairs({"source_home": "C:\\Users\\a"}, {"project_dir": None, "repo_root": None, "home": "/h"})
 
+    def test_pairs_include_aliases(self):
+        meta = {"source_project_dir": "/p", "source_repo_root": "/tmp/r", "source_home": "/tmp/h",
+                "source_repo_root_aliases": ["/private/tmp/r"], "source_home_aliases": ["/private/tmp/h"]}
+        pairs = relay.build_rewrite_pairs(meta, {"project_dir": "/p", "repo_root": "/b/r", "home": "/b/h"})
+        self.assertEqual(pairs, [("/tmp/r", "/b/r", "repo root"), ("/private/tmp/r", "/b/r", "repo root alias"),
+                                 ("/tmp/h", "/b/h", "home"), ("/private/tmp/h", "/b/h", "home alias")])
+        r = relay.Rewriter(pairs)
+        self.assertEqual(r.rewrite_text("/tmp/r/a /private/tmp/r/b /private/tmp/h/c /tmp/h/d"),
+                         "/b/r/a /b/r/b /b/h/c /b/h/d")
+
     def test_windows_style_not_supported_yet(self):
         with self.assertRaises(relay.RelayError):
             relay.path_variants("C:\\Users\\a", "windows")
@@ -485,6 +598,34 @@ class RewriterTest(unittest.TestCase):
             p.write_bytes(data)
             self.assertFalse(relay.Rewriter([("/Users/alice", "/home/bob", "h")]).rewrite_file(p))
             self.assertEqual(p.read_bytes(), data)
+
+
+class LogicalPathTest(unittest.TestCase):
+    def test_logical_root_and_cwd_keep_symlinks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            phys = Path(os.path.realpath(tmp)) / "phys"
+            (phys / "repo" / "sub").mkdir(parents=True)
+            link = Path(tmp) / "link"
+            link.symlink_to(phys)
+            self.assertEqual(relay.logical_root([str(link / "repo" / "sub")], str(phys / "repo")), link / "repo")
+            # Candidates outside the repo are skipped; fallback is the physical root.
+            self.assertEqual(relay.logical_root(["/", None], str(phys / "repo")), phys / "repo")
+            self.assertEqual(relay.resolved_aliases(link / "repo"), [str(phys / "repo")])
+            self.assertEqual(relay.resolved_aliases(phys / "repo"), [])
+            old_cwd, old_pwd = os.getcwd(), os.environ.get("PWD")
+            try:
+                os.chdir(str(link / "repo"))
+                os.environ["PWD"] = str(link / "repo")
+                self.assertEqual(relay.logical_cwd(), link / "repo")
+                os.environ["PWD"] = "/"
+                self.assertEqual(relay.logical_cwd(), Path(os.getcwd()))
+                self.assertEqual(relay.logical_cwd(str(link / "repo")), link / "repo")
+            finally:
+                os.chdir(old_cwd)
+                if old_pwd is None:
+                    os.environ.pop("PWD", None)
+                else:
+                    os.environ["PWD"] = old_pwd
 
 
 class RemotePathTest(unittest.TestCase):
