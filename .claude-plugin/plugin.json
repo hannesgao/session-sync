@@ -1,0 +1,34 @@
+{
+  "name": "session-relay",
+  "displayName": "Session Relay",
+  "version": "0.1.0",
+  "description": "Stop a Claude Code CLI session on one machine and resume the same conversation on another (macOS <-> WSL2 Ubuntu), via any rclone remote.",
+  "author": {
+    "name": "Hannes Gao",
+    "url": "https://github.com/hannesgao"
+  },
+  "homepage": "https://github.com/hannesgao/session-sync",
+  "repository": "https://github.com/hannesgao/session-sync",
+  "keywords": [
+    "sessions",
+    "sync",
+    "handoff",
+    "rclone",
+    "wsl",
+    "macos"
+  ],
+  "userConfig": {
+    "rclone_remote": {
+      "type": "string",
+      "title": "rclone remote",
+      "description": "rclone remote that stores relayed sessions, including the trailing colon, e.g. r2: or b2:my-bucket. Configure it first with `rclone config` on every machine.",
+      "required": true
+    },
+    "base_path": {
+      "type": "string",
+      "title": "Base path on the remote",
+      "description": "Folder under the remote where sessions are stored.",
+      "default": "session-relay"
+    }
+  }
+}
